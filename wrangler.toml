@@ -1,0 +1,22 @@
+name = "live-app"
+compatibility_date = "2024-05-02"
+account_id = ""
+route = ""
+workers_dev = true
+
+[vars]
+BROADCAST_KEY = "SECRET"
+ALLOWED_ORIGINS = ""
+
+[[kv_namespaces]]
+# Placeholder; not used directly but keeps structure flexible
+binding = ""
+id = ""
+preview_id = ""
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "Relay"
+
+[observability]
+enabled = true
