@@ -52,6 +52,14 @@ function dropViewer(ws) {
   ws?.close?.();
 }
 
+function closeAllViewers(viewers, code = 4000, reason = "broadcaster_ended") {
+  for (const viewer of Array.from(viewers)) {
+    safeSend(viewer, JSON.stringify({ type: "eos", reason }));
+    closeSocket(viewer, code, reason);
+    viewers.delete(viewer);
+  }
+}
+
 function parseMessage(event) {
   try {
     const parsed = JSON.parse(event.data);
@@ -94,7 +102,15 @@ export class Relay {
   handleBroadcastMessage(message, sender) {
     switch (message.type) {
       case "video":
-        if (!validateVideoPayload(message)) return;
+        {
+          const err = validateVideoPayload(message);
+          if (err) {
+            if (err === "too_large") {
+              closeSocket(sender, 1009, "frame too large");
+            }
+            return;
+          }
+        }
         for (const viewer of Array.from(this.viewers)) {
           if (!safeSend(viewer, JSON.stringify(message))) {
             this.viewers.delete(viewer);
@@ -103,7 +119,10 @@ export class Relay {
         }
         break;
       case "audio":
-        if (!validateAudioPayload(message)) return;
+        {
+          const err = validateAudioPayload(message);
+          if (err) return;
+        }
         for (const viewer of Array.from(this.viewers)) {
           if (!safeSend(viewer, JSON.stringify(message))) {
             this.viewers.delete(viewer);
@@ -166,12 +185,12 @@ export class Relay {
         if (!msg) return;
         this.handleBroadcastMessage(msg, this.broadcaster);
       });
-      this.broadcaster.addEventListener("close", () => {
+      const onBroadcasterGone = (reason = "broadcaster_closed") => {
         this.broadcaster = null;
-      });
-      this.broadcaster.addEventListener("error", () => {
-        this.broadcaster = null;
-      });
+        closeAllViewers(this.viewers, 4001, reason);
+      };
+      this.broadcaster.addEventListener("close", () => onBroadcasterGone("broadcaster_closed"));
+      this.broadcaster.addEventListener("error", () => onBroadcasterGone("broadcaster_error"));
     } else if (role === "viewer") {
       this.viewers.add(server);
       server.addEventListener("message", (event) => {
