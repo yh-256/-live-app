@@ -28,7 +28,7 @@ Pages Functions を含む挙動確認を行う場合は Cloudflare CLI (Wrangler
 
 ```bash
 # Pages Functions を含めて起動 (推奨)
-wrangler pages dev public --functions=functions
+wrangler pages dev public
 
 # 静的ファイルだけ確認する場合
 python -m http.server 8000
