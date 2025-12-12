@@ -43,6 +43,7 @@
     const bufferEl = document.getElementById('buffer');
     const reconnectEl = document.getElementById('reconnect');
     const banner = document.getElementById('banner');
+    const audioEl = document.getElementById('audio');
 
     let ws = null;
     let backoff = 1000;
@@ -56,6 +57,11 @@
     let audioLagMs = 0;
     let reconnectTimer = null;
     let isStarted = false;
+    let pingTimer = null;
+    let lastPingTs = 0;
+    let lastPongTs = 0;
+    let decodeFailures = 0;
+    let audioFallbackMode = false;
 
     function log(message) { console.log('[viewer]', message); }
 
@@ -94,25 +100,46 @@
     }
 
     async function playAudioChunk(packet) {
-      await ensureAudioContext();
       const data = base64ToArrayBuffer(packet.data);
-      const buffer = await audioCtx.decodeAudioData(data).catch(() => null);
-      if (!buffer) return;
-      if (!audioStartAt) {
-        firstAudioTs = packet.ts;
-        audioStartAt = audioCtx.currentTime + playbackOffsetMs / 1000;
+      const mime = packet.mime || 'audio/webm';
+
+      if (!audioFallbackMode) {
+        await ensureAudioContext();
+        const buffer = await audioCtx.decodeAudioData(data).catch(() => null);
+        if (buffer) {
+          decodeFailures = 0;
+          if (!audioStartAt) {
+            firstAudioTs = packet.ts;
+            audioStartAt = audioCtx.currentTime + playbackOffsetMs / 1000;
+          }
+          const playbackTime = audioStartAt + (packet.ts - firstAudioTs) / 1000;
+          const startTime = Math.max(playbackTime, audioCtx.currentTime + 0.05);
+          if (startTime - audioCtx.currentTime > 1.5) {
+            setBanner('Audio chunk dropped (buffer >1500ms)');
+            return;
+          }
+          const source = audioCtx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(audioCtx.destination);
+          source.start(startTime);
+          return;
+        }
+        decodeFailures += 1;
+        if (decodeFailures < 3) {
+          setBanner('Audio decode retrying...');
+          return;
+        }
+        audioFallbackMode = true;
+        audioStartAt = null;
+        firstAudioTs = null;
+        setBanner('Audio fallback mode');
       }
-      const playbackTime = audioStartAt + (packet.ts - firstAudioTs) / 1000;
-      const startTime = Math.max(playbackTime, audioCtx.currentTime + 0.05);
-      if (startTime - audioCtx.currentTime > 1.5) {
-        // buffer too deep -> drop this chunk
-        setBanner('Audio chunk dropped (buffer >1500ms)');
-        return;
-      }
-      const source = audioCtx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(audioCtx.destination);
-      source.start(startTime);
+
+      // Fallback: play via <audio> element (no A/V sync but audible)
+      const blob = new Blob([data], { type: mime });
+      const url = URL.createObjectURL(blob);
+      audioEl.src = url;
+      audioEl.play().catch(() => {});
     }
 
     function currentAudioTime() {
@@ -182,9 +209,29 @@
         if (videoQueue.length > 80) videoQueue.shift();
       } else if (msg.type === 'audio') {
         playAudioChunk(msg);
+      } else if (msg.type === 'eos') {
+        setBanner('Broadcast ended');
+        ws?.close(4001, 'eos');
+        scheduleReconnect();
       } else if (msg.type === 'ping' && typeof msg.ts === 'number') {
         ws?.send(JSON.stringify({ type: 'pong', ts: msg.ts }));
+      } else if (msg.type === 'pong' && typeof msg.ts === 'number') {
+        lastPongTs = Date.now();
       }
+    }
+
+    function setupPing() {
+      clearInterval(pingTimer);
+      pingTimer = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const now = Date.now();
+        if (lastPingTs && lastPongTs < lastPingTs && now - lastPingTs > 15000) {
+          ws.close(4000, 'pong timeout');
+          return;
+        }
+        lastPingTs = now;
+        ws.send(JSON.stringify({ type: 'ping', ts: now }));
+      }, 5000);
     }
 
     function connect() {
@@ -195,16 +242,19 @@
         setBanner('connected');
         backoff = 1000;
         reconnectAttempts = 0;
+        setupPing();
       });
       ws.addEventListener('message', handleMessage);
       ws.addEventListener('close', () => {
         connectionEl.textContent = 'closed';
         setBanner('disconnected, retrying...');
         scheduleReconnect();
+        clearInterval(pingTimer);
       });
       ws.addEventListener('error', () => {
         connectionEl.textContent = 'error';
         scheduleReconnect();
+        clearInterval(pingTimer);
       });
     }
 
