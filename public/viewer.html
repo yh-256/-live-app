@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Minimal Live Stream - Viewer</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; background: #0b1021; color: #f5f7ff; }
+    h1 { margin-bottom: 8px; }
+    #videoFrame { width: 100%; max-width: 640px; background: #111827; border-radius: 8px; }
+    canvas { display: none; }
+    button { padding: 8px 12px; border: none; border-radius: 6px; background: #4f46e5; color: white; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .status { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin-top: 12px; }
+    .status div { background: #111827; padding: 8px; border-radius: 8px; font-size: 14px; }
+    .banner { padding: 8px; margin-top: 8px; border-radius: 8px; background: #1e293b; }
+  </style>
+</head>
+<body>
+  <h1>Viewer</h1>
+  <div class="controls" style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
+    <button id="play">再生開始</button>
+    <span id="connection">disconnected</span>
+  </div>
+  <img id="videoFrame" alt="video" />
+  <canvas id="canvas" width="1280" height="720"></canvas>
+  <audio id="audio" hidden></audio>
+  <div class="status">
+    <div>Delay: <span id="delay">-</span> ms</div>
+    <div>FPS: <span id="fps">0</span></div>
+    <div>Buffer(ms): <span id="buffer">0</span></div>
+    <div>Reconnect: <span id="reconnect">0</span></div>
+  </div>
+  <div class="banner" id="banner"></div>
+
+  <script>
+    const videoFrame = document.getElementById('videoFrame');
+    const canvas = document.getElementById('canvas');
+    const playBtn = document.getElementById('play');
+    const connectionEl = document.getElementById('connection');
+    const delayEl = document.getElementById('delay');
+    const fpsEl = document.getElementById('fps');
+    const bufferEl = document.getElementById('buffer');
+    const reconnectEl = document.getElementById('reconnect');
+    const banner = document.getElementById('banner');
+
+    let ws = null;
+    let backoff = 1000;
+    let reconnectAttempts = 0;
+    let audioCtx = null;
+    let audioStartAt = null;
+    let firstAudioTs = null;
+    let playbackOffsetMs = 500;
+    let videoQueue = [];
+    let fpsTimes = [];
+    let audioLagMs = 0;
+    let reconnectTimer = null;
+    let isStarted = false;
+
+    function log(message) { console.log('[viewer]', message); }
+
+    function setBanner(text) {
+      banner.textContent = text || '';
+    }
+
+    function updateStatus(partial) {
+      if (partial.delay !== undefined) delayEl.textContent = partial.delay;
+      if (partial.fps !== undefined) fpsEl.textContent = partial.fps.toFixed(1);
+      if (partial.buffer !== undefined) bufferEl.textContent = partial.buffer;
+      if (partial.reconnect !== undefined) reconnectEl.textContent = partial.reconnect;
+      if (partial.connection !== undefined) connectionEl.textContent = partial.connection;
+    }
+
+    function wsUrl() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      return `${proto}://${location.host}/ws?role=viewer`;
+    }
+
+    async function ensureAudioContext() {
+      if (!audioCtx) {
+        audioCtx = new AudioContext();
+      }
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+    }
+
+    function base64ToArrayBuffer(base64) {
+      const binary = atob(base64);
+      const len = binary.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes.buffer;
+    }
+
+    async function playAudioChunk(packet) {
+      await ensureAudioContext();
+      const data = base64ToArrayBuffer(packet.data);
+      const buffer = await audioCtx.decodeAudioData(data).catch(() => null);
+      if (!buffer) return;
+      if (!audioStartAt) {
+        firstAudioTs = packet.ts;
+        audioStartAt = audioCtx.currentTime + playbackOffsetMs / 1000;
+      }
+      const playbackTime = audioStartAt + (packet.ts - firstAudioTs) / 1000;
+      const startTime = Math.max(playbackTime, audioCtx.currentTime + 0.05);
+      if (startTime - audioCtx.currentTime > 1.5) {
+        // too far in future -> trim
+        audioStartAt -= 0.3;
+        setBanner('Audio buffer trimmed');
+      }
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      source.start(startTime);
+    }
+
+    function currentAudioTime() {
+      if (!audioCtx || audioStartAt === null || firstAudioTs === null) return null;
+      const drift = (audioCtx.currentTime - audioStartAt) * 1000;
+      return firstAudioTs + drift;
+    }
+
+    function scheduleVideo() {
+      if (videoQueue.length === 0) {
+        requestAnimationFrame(scheduleVideo);
+        return;
+      }
+      const audioTime = currentAudioTime();
+      const ctx = canvas.getContext('2d');
+      if (audioTime === null) {
+        const frame = videoQueue.shift();
+        drawFrame(frame, ctx);
+        requestAnimationFrame(scheduleVideo);
+        return;
+      }
+      const target = videoQueue.filter((f) => f.ts <= audioTime);
+      const frame = target[target.length - 1];
+      if (frame) {
+        videoQueue = videoQueue.filter((f) => f.ts > frame.ts).slice(-50);
+        drawFrame(frame, ctx);
+      } else if (videoQueue.length > 20) {
+        // too late
+        videoQueue.shift();
+      }
+      const delta = frame ? frame.ts - audioTime : 0;
+      if (Math.abs(delta) > 400 && frame) {
+        setBanner('A/V reset');
+        videoQueue = [];
+        if (audioCtx && firstAudioTs !== null) {
+          audioStartAt = audioCtx.currentTime + playbackOffsetMs / 1000;
+          firstAudioTs = frame.ts;
+        }
+      } else if (Math.abs(delta) > 150 && frame) {
+        setBanner('Minor sync adjust');
+        audioStartAt -= delta / 1000 * 0.2;
+      }
+      audioLagMs = frame ? -delta : audioLagMs;
+      fpsTimes.push(performance.now());
+      fpsTimes = fpsTimes.filter((t) => t > performance.now() - 3000);
+      updateStatus({ delay: Math.round(audioLagMs), fps: fpsTimes.length / 3, buffer: Math.round(videoQueue.length * 50) });
+      requestAnimationFrame(scheduleVideo);
+    }
+
+    function drawFrame(frame, ctx) {
+      const img = new Image();
+      img.onload = () => {
+        ctx.canvas.width = img.naturalWidth;
+        ctx.canvas.height = img.naturalHeight;
+        ctx.drawImage(img, 0, 0);
+        videoFrame.src = ctx.canvas.toDataURL('image/jpeg', 0.8);
+      };
+      img.src = frame.data;
+    }
+
+    function handleMessage(event) {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (e) { return; }
+      if (!msg || typeof msg.type !== 'string') return;
+      if (msg.type === 'video') {
+        videoQueue.push({ ts: msg.ts, data: msg.data });
+        if (videoQueue.length > 80) videoQueue.shift();
+      } else if (msg.type === 'audio') {
+        playAudioChunk(msg);
+      } else if (msg.type === 'ping' && typeof msg.ts === 'number') {
+        ws?.send(JSON.stringify({ type: 'pong', ts: msg.ts }));
+      }
+    }
+
+    function connect() {
+      ws = new WebSocket(wsUrl());
+      connectionEl.textContent = 'connecting';
+      ws.addEventListener('open', () => {
+        connectionEl.textContent = 'connected';
+        setBanner('connected');
+        backoff = 1000;
+        reconnectAttempts = 0;
+      });
+      ws.addEventListener('message', handleMessage);
+      ws.addEventListener('close', () => {
+        connectionEl.textContent = 'closed';
+        setBanner('disconnected, retrying...');
+        scheduleReconnect();
+      });
+      ws.addEventListener('error', () => {
+        connectionEl.textContent = 'error';
+        scheduleReconnect();
+      });
+    }
+
+    function scheduleReconnect() {
+      if (!isStarted) return;
+      reconnectAttempts += 1;
+      reconnectEl.textContent = reconnectAttempts;
+      backoff = Math.min(backoff * 2, 30000);
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => connect(), backoff);
+    }
+
+    playBtn.addEventListener('click', async () => {
+      isStarted = true;
+      playBtn.disabled = true;
+      await ensureAudioContext();
+      connect();
+      scheduleVideo();
+    });
+  </script>
+</body>
+</html>
