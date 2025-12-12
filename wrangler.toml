@@ -1,0 +1,8 @@
+name = "minimal-live-stream"
+compatibility_date = "2024-07-01"
+
+[vars]
+BROADCAST_KEY = "SECRET"
+
+[dev]
+local_protocol = "http"
