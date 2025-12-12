@@ -9,7 +9,7 @@ public/            # 配信者・視聴者 UI
   broadcaster.html
   viewer.html
 functions/
-  ws.js            # WebSocket 中継 (Pages Functions)
+ ws.js            # WebSocket 中継 (Pages Functions + Durable Object Relay)
 wrangler.toml      # ローカル開発・Pages Functions 設定
 ```
 
@@ -40,12 +40,14 @@ python -m http.server 8000
 ## 本番デプロイ (Cloudflare Pages)
 
 1. Cloudflare Pages プロジェクトを作成し、このリポジトリを接続。
-2. Pages Functions を有効化し、**環境変数** を設定:
+2. Pages Functions を有効化し、**Durable Object バインディング** を 1 件作成:
+   - Name: `RELAY`, Class name: `Relay`
+3. **環境変数** を設定:
    - `BROADCAST_KEY`: 配信者用の共有キー
    - `ALLOWED_ORIGINS`: `https://<your-project>.pages.dev,https://<custom-domain>` 形式
-3. ビルド設定は不要（静的配信のため Build command/Output dir は空欄 or `public`）。
-4. デプロイ後、`https://<your-project>.pages.dev/public/broadcaster.html` で配信開始、`viewer.html` で視聴を確認。
-5. 独自ドメインを利用する場合は SSL/TLS を有効化し、`ALLOWED_ORIGINS` に追記して再デプロイ。
+4. ビルド設定は不要（静的配信のため Build command/Output dir は空欄 or `public`）。
+5. デプロイ後、`https://<your-project>.pages.dev/public/broadcaster.html` で配信開始、`viewer.html` で視聴を確認。
+6. 独自ドメインを利用する場合は SSL/TLS を有効化し、`ALLOWED_ORIGINS` に追記して再デプロイ。
 
 ### Wrangler 経由でのデプロイ
 

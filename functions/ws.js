@@ -1,6 +1,4 @@
-// Cloudflare Pages Functions WebSocket relay
-let broadcaster = null;
-let viewers = new Set();
+// Cloudflare Pages Functions WebSocket relay backed by a Durable Object to avoid isolate splits
 
 const FALLBACK_ALLOWED_ORIGINS = [
   "http://localhost:8788",
@@ -33,8 +31,18 @@ function safeSend(ws, payload) {
 }
 
 function dropViewer(ws) {
-  viewers.delete(ws);
-  closeSocket(ws);
+  ws?.close?.();
+}
+
+function parseMessage(event) {
+  try {
+    const parsed = JSON.parse(event.data);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    if (typeof parsed.type !== "string") return null;
+    return parsed;
+  } catch (err) {
+    return null;
+  }
 }
 
 function validateVideoPayload(message) {
@@ -53,56 +61,111 @@ function validateAudioPayload(message) {
   return true;
 }
 
-function handleBroadcastMessage(message, sender) {
-  switch (message.type) {
-    case "video":
-      if (!validateVideoPayload(message)) return;
-      for (const viewer of Array.from(viewers)) {
-        if (!safeSend(viewer, JSON.stringify(message))) {
-          dropViewer(viewer);
+// Durable Object that keeps all WebSocket peers on a single isolate
+export class Relay {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.broadcaster = null;
+    this.viewers = new Set();
+  }
+
+  handleBroadcastMessage(message, sender) {
+    switch (message.type) {
+      case "video":
+        if (!validateVideoPayload(message)) return;
+        for (const viewer of Array.from(this.viewers)) {
+          if (!safeSend(viewer, JSON.stringify(message))) {
+            this.viewers.delete(viewer);
+            dropViewer(viewer);
+          }
         }
-      }
-      break;
-    case "audio":
-      if (!validateAudioPayload(message)) return;
-      for (const viewer of Array.from(viewers)) {
-        if (!safeSend(viewer, JSON.stringify(message))) {
-          dropViewer(viewer);
+        break;
+      case "audio":
+        if (!validateAudioPayload(message)) return;
+        for (const viewer of Array.from(this.viewers)) {
+          if (!safeSend(viewer, JSON.stringify(message))) {
+            this.viewers.delete(viewer);
+            dropViewer(viewer);
+          }
         }
+        break;
+      case "ping": {
+        if (typeof message.ts !== "number") return;
+        safeSend(sender, JSON.stringify({ type: "pong", ts: message.ts }));
+        break;
       }
-      break;
-    case "ping": {
-      if (typeof message.ts !== "number") return;
-      safeSend(sender, JSON.stringify({ type: "pong", ts: message.ts }));
-      break;
+      case "pong":
+        break;
+      default:
+        break;
     }
-    case "pong":
-      // ignored at server
-      break;
-    default:
-      break;
   }
-}
 
-function handleViewerMessage(message, sender) {
-  switch (message.type) {
-    case "ping":
-      if (typeof message.ts !== "number") return;
-      safeSend(sender, JSON.stringify({ type: "pong", ts: message.ts }));
-      break;
-    default:
-      break;
+  handleViewerMessage(message, sender) {
+    switch (message.type) {
+      case "ping":
+        if (typeof message.ts !== "number") return;
+        safeSend(sender, JSON.stringify({ type: "pong", ts: message.ts }));
+        break;
+      default:
+        break;
+    }
   }
-}
 
-function parseMessage(event) {
-  try {
-    const parsed = JSON.parse(event.data);
-    if (typeof parsed !== "object" || parsed === null) return null;
-    if (typeof parsed.type !== "string") return null;
-    return parsed;
-  } catch (err) {
-    return null;
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname !== "/ws") {
+      return new Response("Not found", { status: 404 });
+    }
+
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("Expected websocket", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+
+    const role = url.searchParams.get("role");
+    const key = url.searchParams.get("key");
+    const broadcastKey = this.env?.BROADCAST_KEY || "SECRET";
+
+    if (role === "broadcaster") {
+      if (key !== broadcastKey) {
+        closeSocket(server, 1008, "Invalid key");
+        return new Response(null, { status: 101, webSocket: client });
+      }
+      if (this.broadcaster) {
+        closeSocket(this.broadcaster, 4000, "superseded");
+      }
+      this.broadcaster = server;
+      this.broadcaster.addEventListener("message", (event) => {
+        const msg = parseMessage(event);
+        if (!msg) return;
+        this.handleBroadcastMessage(msg, this.broadcaster);
+      });
+      this.broadcaster.addEventListener("close", () => {
+        this.broadcaster = null;
+      });
+      this.broadcaster.addEventListener("error", () => {
+        this.broadcaster = null;
+      });
+    } else if (role === "viewer") {
+      this.viewers.add(server);
+      server.addEventListener("message", (event) => {
+        const msg = parseMessage(event);
+        if (!msg) return;
+        this.handleViewerMessage(msg, server);
+      });
+      const cleanup = () => this.viewers.delete(server);
+      server.addEventListener("close", cleanup);
+      server.addEventListener("error", cleanup);
+    } else {
+      closeSocket(server, 1008, "Invalid role");
+    }
+
+    return new Response(null, { status: 101, webSocket: client });
   }
 }
 
@@ -122,46 +185,7 @@ export async function onRequest(context) {
     return new Response("Expected websocket", { status: 426 });
   }
 
-  const pair = new WebSocketPair();
-  const [client, server] = Object.values(pair);
-  server.accept();
-
-  const role = url.searchParams.get("role");
-  const key = url.searchParams.get("key");
-  const broadcastKey = env?.BROADCAST_KEY || "SECRET";
-
-  if (role === "broadcaster") {
-    if (key !== broadcastKey) {
-      closeSocket(server, 1008, "Invalid key");
-      return new Response(null, { status: 101, webSocket: client });
-    }
-    if (broadcaster) {
-      closeSocket(broadcaster, 4000, "superseded");
-    }
-    broadcaster = server;
-    broadcaster.addEventListener("message", (event) => {
-      const msg = parseMessage(event);
-      if (!msg) return;
-      handleBroadcastMessage(msg, broadcaster);
-    });
-    broadcaster.addEventListener("close", () => {
-      broadcaster = null;
-    });
-    broadcaster.addEventListener("error", () => {
-      broadcaster = null;
-    });
-  } else if (role === "viewer") {
-    viewers.add(server);
-    server.addEventListener("message", (event) => {
-      const msg = parseMessage(event);
-      if (!msg) return;
-      handleViewerMessage(msg, server);
-    });
-    server.addEventListener("close", () => viewers.delete(server));
-    server.addEventListener("error", () => viewers.delete(server));
-  } else {
-    closeSocket(server, 1008, "Invalid role");
-  }
-
-  return new Response(null, { status: 101, webSocket: client });
+  const relayId = env.RELAY.idFromName("default");
+  const stub = env.RELAY.get(relayId);
+  return stub.fetch(request);
 }
