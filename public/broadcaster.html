@@ -75,6 +75,14 @@
     const stateEl = document.getElementById('state');
     const connectionEl = document.getElementById('connection');
 
+    const MAX_IMAGE_BASE64 = 750000; // must match server limit
+    const AUDIO_MIME_CANDIDATES = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/mp4',
+    ];
+
     const resolutions = {
       low: { width: 320, height: 240 },
       medium: { width: 640, height: 480 },
@@ -90,6 +98,7 @@
     let ws = null;
     let mediaStream = null;
     let mediaRecorder = null;
+    let chosenAudioMime = null;
     let sending = false;
     let frameTimes = [];
     let qualityIndex = 0;
@@ -171,14 +180,33 @@
       });
     }
 
+    function pickAudioMime() {
+      for (const cand of AUDIO_MIME_CANDIDATES) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(cand)) {
+          return cand;
+        }
+      }
+      return null;
+    }
+
     function sendAudio() {
       if (!mediaStream) return;
-      mediaRecorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm' });
+      const audioTrack = mediaStream.getAudioTracks()[0];
+      if (!audioTrack) return;
+      const audioStream = new MediaStream([audioTrack]);
+      chosenAudioMime = pickAudioMime();
+      const options = chosenAudioMime ? { mimeType: chosenAudioMime } : {};
+      try {
+        mediaRecorder = new MediaRecorder(audioStream, options);
+      } catch (e) {
+        console.error('MediaRecorder failed', e);
+        throw e;
+      }
       mediaRecorder.ondataavailable = async (event) => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         const base64 = await base64FromBlob(event.data);
         if (base64.length > 300000) return;
-        const payload = { type: 'audio', ts: Date.now(), data: base64 };
+        const payload = { type: 'audio', ts: Date.now(), data: base64, mime: chosenAudioMime || undefined };
         ws.send(JSON.stringify(payload));
       };
       mediaRecorder.start(500);
@@ -233,7 +261,9 @@
       const ctx = canvas.getContext('2d');
       ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
       const dataUrl = canvas.toDataURL('image/jpeg', quality.jpegQuality);
-      if (dataUrl.length < 900000) {
+      if (dataUrl.length > MAX_IMAGE_BASE64) {
+        attemptDowngrade('too_large');
+      } else {
         const payload = { type: 'video', ts: Date.now(), data: dataUrl };
         ws.send(JSON.stringify(payload));
       }
