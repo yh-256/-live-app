@@ -261,7 +261,8 @@
       const ctx = canvas.getContext('2d');
       ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
       const dataUrl = canvas.toDataURL('image/jpeg', quality.jpegQuality);
-      if (dataUrl.length > MAX_IMAGE_BASE64) {
+      const base64Len = dataUrl.length - 'data:image/jpeg;base64,'.length;
+      if (base64Len > MAX_IMAGE_BASE64) {
         attemptDowngrade('too_large');
       } else {
         const payload = { type: 'video', ts: Date.now(), data: dataUrl };
