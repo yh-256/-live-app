@@ -1,16 +1,34 @@
 // Cloudflare Pages Functions WebSocket relay backed by a Durable Object to avoid isolate splits
 
+const MAX_IMAGE_BASE64 = 750_000; // unified client/server JPEG base64 length limit
 const FALLBACK_ALLOWED_ORIGINS = [
   "http://localhost:8788",
   "http://127.0.0.1:8788",
 ];
 
+function normalizeOrigin(value) {
+  try {
+    return new URL(value).origin;
+  } catch (_err) {
+    return null;
+  }
+}
+
 function isOriginAllowed(origin, requestHost, env) {
-  if (!origin) return true; // allow null origins for local file/testing
-  const envOrigins = env?.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(",") : [];
-  const dynamic = [`https://${requestHost}`, `http://${requestHost}`];
-  const allowedList = [...envOrigins, ...FALLBACK_ALLOWED_ORIGINS, ...dynamic].filter(Boolean);
-  return allowedList.some((allowed) => origin.startsWith(allowed));
+  const allowNull = env?.ALLOW_NULL_ORIGIN === "true";
+  if (!origin) return allowNull;
+
+  const normalized = normalizeOrigin(origin);
+  if (!normalized) return false;
+
+  const envOrigins = env?.ALLOWED_ORIGINS
+    ? env.ALLOWED_ORIGINS.split(",").map((o) => normalizeOrigin(o.trim())).filter(Boolean)
+    : [];
+  const dynamic = [normalizeOrigin(`https://${requestHost}`), normalizeOrigin(`http://${requestHost}`)].filter(Boolean);
+  const fallback = FALLBACK_ALLOWED_ORIGINS.map(normalizeOrigin).filter(Boolean);
+
+  const allowedList = [...envOrigins, ...fallback, ...dynamic];
+  return allowedList.includes(normalized);
 }
 
 function closeSocket(ws, code = 1000, reason = "") {
@@ -46,19 +64,22 @@ function parseMessage(event) {
 }
 
 function validateVideoPayload(message) {
-  if (typeof message.data !== "string") return false;
-  if (!message.data.startsWith("data:image/jpeg;base64,")) return false;
+  if (typeof message.data !== "string") return "invalid_data";
+  if (!message.data.startsWith("data:image/jpeg;base64,")) return "invalid_format";
   const base64 = message.data.slice("data:image/jpeg;base64,".length);
-  if (base64.length > 800000) return false; // ~600KB base64
-  if (typeof message.ts !== "number") return false;
-  return true;
+  if (base64.length > MAX_IMAGE_BASE64) return "too_large";
+  if (typeof message.ts !== "number") return "invalid_ts";
+  return null;
 }
 
 function validateAudioPayload(message) {
-  if (typeof message.data !== "string") return false;
-  if (message.data.length > 400000) return false;
-  if (typeof message.ts !== "number") return false;
-  return true;
+  if (typeof message.data !== "string") return "invalid_data";
+  if (message.data.length > 400000) return "too_large";
+  if (typeof message.ts !== "number") return "invalid_ts";
+  if (message.mime !== undefined && (typeof message.mime !== "string" || message.mime.length > 100)) {
+    return "invalid_mime";
+  }
+  return null;
 }
 
 // Durable Object that keeps all WebSocket peers on a single isolate
