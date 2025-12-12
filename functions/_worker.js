@@ -1,6 +1,5 @@
-import { onRequest as handleWs, Relay } from "../functions/ws";
+import { onRequest as handleWs, Relay } from "./ws";
 
-// Export Durable Object class so wrangler can bind it
 export { Relay };
 
 export default {
@@ -9,7 +8,6 @@ export default {
     if (url.pathname === "/ws") {
       return handleWs({ request, env, ctx });
     }
-    // serve static assets
     return env.ASSETS.fetch(request);
   },
 };
