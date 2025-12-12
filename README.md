@@ -17,8 +17,8 @@ wrangler.toml      # ローカル開発・Pages Functions 設定
 
 - **メディア取得**: `broadcaster.html` で `getUserMedia` によりカメラ/マイクを取得し、解像度プリセット (Low/Medium/High) とカメラ向き (Front/Back) を選択可能。マイクはトグルで `track.enabled` を切り替え。
 - **送信**: 映像は `<canvas>` で JPEG へエンコードし、音声は `MediaRecorder` の 500ms chunk (audio/webm/Opus) を base64 化して WebSocket 送信。品質は JPEG 品質/FPS/解像度の 3 段階を ABR 風に自動降格・復帰。
-- **同期/再生**: 視聴側は音声をマスタークロックにし、映像はキューから過去で最新のフレームを選択。A/V ズレが ±400ms を超えるとリセット、150–400ms で軽度補正。初期 500ms バッファ、溢れた音声チャンクは破棄。
-- **安定化**: 5 秒ごとに ping/pong で RTT 測定。`bufferedAmount` と実効 FPS を監視し、WARN/DROP 閾値で品質を段階的にダウン。30 秒安定時は 1 段階アップ。pong 欠落 30 秒で送信側を切断し再接続を促す。
+- **同期/再生**: 視聴側は音声をマスタークロックにし、映像はキューから過去で最新のフレームを選択。A/V ズレが ±400ms を超えるとリセット、150–400ms で軽度補正。初期 500ms バッファ、1.5 秒を超えて先行した音声チャンクは破棄して追従させる。
+- **安定化**: 5 秒ごとに ping/pong で RTT 測定。`bufferedAmount` と実効 FPS を監視し、WARN 200KB / DROP 500KB 閾値で品質を段階的にダウン。30 秒安定時は 1 段階アップ。pong 欠落 30 秒で送信側を切断し再接続を促す。送信 UI に Strong/Normal/Weak/Bad の接続強度バッジを表示。
 - **セキュリティ**: Origin を `ALLOWED_ORIGINS`（環境変数）とローカル用ホワイトリストで検査し、配信者には `?key=` が必須。ペイロードは JSON/型/JPEG dataURL/base64 長を検証し、不正メッセージや send 失敗視聴者は即破棄。
 - **自動再接続**: 視聴側は指数バックオフ (1→2→4…最大 30s) で再接続し、接続状態や再接続回数を UI 表示。
 

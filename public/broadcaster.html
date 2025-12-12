@@ -56,6 +56,7 @@
     <div>Quality: <span id="quality" class="badge">-</span></div>
     <div>Buffered: <span id="buffered">0</span> KB</div>
     <div>State: <span id="state">idle</span></div>
+    <div>Connection: <span id="connection" class="badge">-</span></div>
   </div>
 
   <script>
@@ -72,6 +73,7 @@
     const qualityEl = document.getElementById('quality');
     const bufferedEl = document.getElementById('buffered');
     const stateEl = document.getElementById('state');
+    const connectionEl = document.getElementById('connection');
 
     const resolutions = {
       low: { width: 320, height: 240 },
@@ -93,6 +95,7 @@
     let qualityIndex = 0;
     let downgradeAt = 0;
     let stableSince = 0;
+    let warnCount = 0;
     let rafId = null;
     let lastPingTs = 0;
     let lastPongTs = 0;
@@ -108,6 +111,7 @@
       if (partial.quality !== undefined) qualityEl.textContent = partial.quality;
       if (partial.buffered !== undefined) bufferedEl.textContent = partial.buffered;
       if (partial.state !== undefined) stateEl.textContent = partial.state;
+      if (partial.connection !== undefined) connectionEl.textContent = partial.connection;
     }
 
     function currentQuality() {
@@ -242,14 +246,39 @@
       const buf = ws.bufferedAmount;
       const nowTs = Date.now();
       if (buf > 500000 || fpsNow < quality.fps - 2 || (lastPongTs && nowTs - lastPongTs > 15000)) {
-        attemptDowngrade('congestion');
+        warnCount = 0;
+        attemptDowngrade('drop');
+      } else if (buf > 200000) {
+        warnCount += 1;
+        if (warnCount >= 3) {
+          attemptDowngrade('warn');
+          warnCount = 0;
+        }
       } else if (buf < 200000 && fpsNow >= quality.fps - 1) {
+        warnCount = 0;
         if (!stableSince) stableSince = Date.now();
         attemptUpgrade();
       }
 
+      updateConnectionStrength({ rtt: rttEl.textContent, fpsNow, buf });
+
       const frameInterval = 1000 / quality.fps;
       rafId = setTimeout(() => requestAnimationFrame(drawLoop), frameInterval);
+    }
+
+    function updateConnectionStrength({ rtt, fpsNow, buf }) {
+      const targetFps = currentQuality().fps;
+      const fpsRatio = fpsNow / targetFps;
+      const rttNum = Number(rtt);
+      let label = 'Normal';
+      if ((buf > 500000) || fpsRatio < 0.4 || rttNum > 400) {
+        label = 'Bad';
+      } else if (buf > 200000 || fpsRatio < 0.7 || rttNum > 250) {
+        label = 'Weak';
+      } else if (buf < 80000 && fpsRatio > 0.9 && rttNum > 0 && rttNum < 120) {
+        label = 'Strong';
+      }
+      updateStatus({ connection: label });
     }
 
     function setupPing() {

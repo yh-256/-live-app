@@ -105,9 +105,9 @@
       const playbackTime = audioStartAt + (packet.ts - firstAudioTs) / 1000;
       const startTime = Math.max(playbackTime, audioCtx.currentTime + 0.05);
       if (startTime - audioCtx.currentTime > 1.5) {
-        // too far in future -> trim
-        audioStartAt -= 0.3;
-        setBanner('Audio buffer trimmed');
+        // buffer too deep -> drop this chunk
+        setBanner('Audio chunk dropped (buffer >1500ms)');
+        return;
       }
       const source = audioCtx.createBufferSource();
       source.buffer = buffer;
