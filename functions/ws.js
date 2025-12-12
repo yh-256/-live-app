@@ -1,5 +1,3 @@
-// Cloudflare Pages Functions WebSocket relay backed by a Durable Object to avoid isolate splits
-
 const MAX_IMAGE_BASE64 = 750_000; // unified client/server JPEG base64 length limit
 const FALLBACK_ALLOWED_ORIGINS = [
   "http://localhost:8788",
