@@ -235,6 +235,8 @@
     }
 
     function connect() {
+      lastPingTs = 0;
+      lastPongTs = 0;
       ws = new WebSocket(wsUrl());
       connectionEl.textContent = 'connecting';
       ws.addEventListener('open', () => {
