@@ -9,13 +9,19 @@ directory = "./public"
 [vars]
 BROADCAST_KEY = "SECRET"
 ALLOWED_ORIGINS = ""
+REALTIME_APP_ID = ""
+REALTIME_API_TOKEN = ""
+REALTIME_BASE_URL = "https://rtc.live.cloudflare.com/v1"
 
 [durable_objects]
-bindings = [{ name = "RELAY", class_name = "Relay" }]
+bindings = [
+  { name = "RELAY", class_name = "Relay" },
+  { name = "ROOM_STATE", class_name = "RoomState" },
+]
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["Relay"]
+new_sqlite_classes = ["Relay", "RoomState"]
 
 [observability]
 enabled = true
