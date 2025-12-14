@@ -8,274 +8,329 @@
     body { font-family: system-ui, sans-serif; margin: 16px; background: #0b1021; color: #f5f7ff; }
     h1 { margin-bottom: 8px; }
     #videoFrame { width: 100%; max-width: 640px; background: #111827; border-radius: 8px; }
-    canvas { display: none; }
     button { padding: 8px 12px; border: none; border-radius: 6px; background: #4f46e5; color: white; cursor: pointer; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .controls { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; align-items: center; }
+    .controls label { display: flex; flex-direction: column; font-size: 14px; gap: 4px; }
     .status { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin-top: 12px; }
     .status div { background: #111827; padding: 8px; border-radius: 8px; font-size: 14px; }
     .banner { padding: 8px; margin-top: 8px; border-radius: 8px; background: #1e293b; }
+    input { padding: 6px; border-radius: 6px; border: 1px solid #1f2937; background: #0f172a; color: #f9fafb; }
   </style>
 </head>
 <body>
   <h1>Viewer</h1>
-  <div class="controls" style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
+  <div class="controls">
+    <label>Room ID
+      <input id="roomIdInput" type="text" placeholder="room id">
+    </label>
+    <label>Watch Code
+      <input id="watchCodeInput" type="text" placeholder="watch code">
+    </label>
     <button id="play">再生開始</button>
     <span id="connection">disconnected</span>
   </div>
-  <img id="videoFrame" alt="video" />
-  <canvas id="canvas" width="1280" height="720"></canvas>
-  <audio id="audio" hidden></audio>
+  <video id="videoFrame" autoplay playsinline controls></video>
   <div class="status">
     <div>Delay: <span id="delay">-</span> ms</div>
     <div>FPS: <span id="fps">0</span></div>
     <div>Buffer(ms): <span id="buffer">0</span></div>
     <div>Reconnect: <span id="reconnect">0</span></div>
+    <div>Viewers: <span id="viewerCount">-</span>/<span id="viewerLimit">-</span></div>
+    <div>Room State: <span id="roomState">idle</span></div>
   </div>
   <div class="banner" id="banner"></div>
 
   <script>
-    const videoFrame = document.getElementById('videoFrame');
-    const canvas = document.getElementById('canvas');
-    const playBtn = document.getElementById('play');
-    const connectionEl = document.getElementById('connection');
-    const delayEl = document.getElementById('delay');
-    const fpsEl = document.getElementById('fps');
-    const bufferEl = document.getElementById('buffer');
-    const reconnectEl = document.getElementById('reconnect');
-    const banner = document.getElementById('banner');
-    const audioEl = document.getElementById('audio');
+    const videoFrame = document.getElementById("videoFrame");
+    const playBtn = document.getElementById("play");
+    const connectionEl = document.getElementById("connection");
+    const delayEl = document.getElementById("delay");
+    const fpsEl = document.getElementById("fps");
+    const bufferEl = document.getElementById("buffer");
+    const reconnectEl = document.getElementById("reconnect");
+    const banner = document.getElementById("banner");
+    const roomInput = document.getElementById("roomIdInput");
+    const codeInput = document.getElementById("watchCodeInput");
+    const viewerCountEl = document.getElementById("viewerCount");
+    const viewerLimitEl = document.getElementById("viewerLimit");
+    const roomStateEl = document.getElementById("roomState");
 
-    let ws = null;
-    let backoff = 1000;
-    let reconnectAttempts = 0;
-    let audioCtx = null;
-    let audioStartAt = null;
-    let firstAudioTs = null;
-    let playbackOffsetMs = 500;
-    let videoQueue = [];
-    let fpsTimes = [];
-    let audioLagMs = 0;
+    const JSON_HEADER = { "Content-Type": "application/json" };
+    const MAX_RECONNECTS = 5;
+
+    let pc = null;
+    let statsTimer = null;
+    let statusTimer = null;
     let reconnectTimer = null;
-    let isStarted = false;
-    let pingTimer = null;
-    let lastPingTs = 0;
-    let lastPongTs = 0;
-    let decodeFailures = 0;
-    let audioFallbackMode = false;
+    let retries = 0;
+    let backoff = 1000;
+    let isPlaying = false;
+    let viewerId = null;
+    let currentRoomId = "";
+    let currentWatchCode = "";
 
-    function log(message) { console.log('[viewer]', message); }
-
-    function setBanner(text) {
-      banner.textContent = text || '';
+    function setBanner(message) {
+      banner.textContent = message || "";
     }
 
-    function updateStatus(partial) {
-      if (partial.delay !== undefined) delayEl.textContent = partial.delay;
-      if (partial.fps !== undefined) fpsEl.textContent = partial.fps.toFixed(1);
-      if (partial.buffer !== undefined) bufferEl.textContent = partial.buffer;
-      if (partial.reconnect !== undefined) reconnectEl.textContent = partial.reconnect;
-      if (partial.connection !== undefined) connectionEl.textContent = partial.connection;
+    function updateConnectionState(state) {
+      connectionEl.textContent = state;
     }
 
-    function wsUrl() {
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      return `${proto}://${location.host}/ws?role=viewer`;
+    function resetIndicators() {
+      delayEl.textContent = "-";
+      fpsEl.textContent = "0";
+      bufferEl.textContent = "0";
+      reconnectEl.textContent = "0";
+      viewerCountEl.textContent = "-";
+      viewerLimitEl.textContent = "-";
+      roomStateEl.textContent = "idle";
     }
 
-    async function ensureAudioContext() {
-      if (!audioCtx) {
-        audioCtx = new AudioContext();
+    async function fetchRoomStatus(roomId) {
+      if (!roomId) {
+        throw new Error("room_id_required");
       }
-      if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
+      const response = await fetch(`/api/room/${roomId}/status`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || "status_error");
+      }
+      return payload;
+    }
+
+    async function pollRoomStatus() {
+      if (!currentRoomId) return;
+      try {
+        const status = await fetchRoomStatus(currentRoomId);
+        viewerCountEl.textContent = status.viewerCount ?? "-";
+        viewerLimitEl.textContent = status.limits?.viewerLimit ?? "-";
+        roomStateEl.textContent = status.state || "-";
+        if (status.limits?.full) {
+          setBanner("満員です");
+          scheduleReconnect("満員のため再接続を停止します");
+        } else {
+          setBanner("");
+        }
+      } catch (error) {
+        console.warn("room status poll failed", error);
       }
     }
 
-    function base64ToArrayBuffer(base64) {
-      const binary = atob(base64);
-      const len = binary.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-      return bytes.buffer;
+    function startStatusTimer() {
+      stopStatusTimer();
+      statusTimer = setInterval(pollRoomStatus, 5000);
     }
 
-    async function playAudioChunk(packet) {
-      const data = base64ToArrayBuffer(packet.data);
-      const mime = packet.mime || 'audio/webm';
+    function stopStatusTimer() {
+      if (statusTimer) {
+        clearInterval(statusTimer);
+        statusTimer = null;
+      }
+    }
 
-      if (!audioFallbackMode) {
-        await ensureAudioContext();
-        const buffer = await audioCtx.decodeAudioData(data).catch(() => null);
-        if (buffer) {
-          decodeFailures = 0;
-          if (!audioStartAt) {
-            firstAudioTs = packet.ts;
-            audioStartAt = audioCtx.currentTime + playbackOffsetMs / 1000;
+    function stopStatsTimer() {
+      if (statsTimer) {
+        clearInterval(statsTimer);
+        statsTimer = null;
+      }
+    }
+
+    function startStatsTimer() {
+      stopStatsTimer();
+      statsTimer = setInterval(() => {
+        if (!pc) return;
+        pc.getStats().then((reports) => {
+          reports.forEach((report) => {
+            if (report.type === "inbound-rtp" && report.kind === "video") {
+              const rttMs = report.roundTripTime ? Math.round(report.roundTripTime * 1000) : "-";
+              const jitter = report.jitter ? Math.round(report.jitter * 1000) : "0";
+              delayEl.textContent = typeof rttMs === "number" ? rttMs : "-";
+              bufferEl.textContent = jitter;
+              fpsEl.textContent = (report.framesDecoded || 0).toString();
+              const loss = report.packetsLost || 0;
+              const received = report.packetsReceived || 0;
+              const total = received + loss;
+              const lossRatio = total ? loss / total : 0;
+              let label = "Normal";
+              if (lossRatio > 0.05 || (typeof rttMs === "number" && rttMs > 400)) {
+                label = "Bad";
+              } else if (lossRatio > 0.02 || (typeof rttMs === "number" && rttMs > 250)) {
+                label = "Weak";
+              } else if (lossRatio < 0.005 && typeof rttMs === "number" && rttMs < 120) {
+                label = "Strong";
+              }
+              updateConnectionState(label);
+            }
+          });
+        });
+      }, 2000);
+    }
+
+    function cleanupPeer() {
+      if (pc) {
+        pc.close();
+        pc = null;
+      }
+    }
+
+    async function leaveRoom() {
+      if (!currentRoomId || !viewerId) return;
+      await fetch(`/api/room/${currentRoomId}/viewer/leave`, {
+        method: "POST",
+        headers: JSON_HEADER,
+        body: JSON.stringify({ viewerId }),
+      }).catch(() => {});
+      viewerId = null;
+    }
+
+    async function waitIce() {
+      if (!pc) return;
+      if (pc.iceGatheringState === "complete") return;
+      await new Promise((resolve) => {
+        const handler = () => {
+          if (pc.iceGatheringState === "complete") {
+            pc.removeEventListener("icegatheringstatechange", handler);
+            resolve();
           }
-          const playbackTime = audioStartAt + (packet.ts - firstAudioTs) / 1000;
-          const startTime = Math.max(playbackTime, audioCtx.currentTime + 0.05);
-          if (startTime - audioCtx.currentTime > 1.5) {
-            setBanner('Audio chunk dropped (buffer >1500ms)');
-            return;
-          }
-          const source = audioCtx.createBufferSource();
-          source.buffer = buffer;
-          source.connect(audioCtx.destination);
-          source.start(startTime);
-          return;
+        };
+        pc.addEventListener("icegatheringstatechange", handler);
+      });
+    }
+
+    function handlePCState() {
+      if (!pc) return;
+      const state = pc.connectionState;
+      if (state === "failed" || state === "disconnected") {
+        scheduleReconnect("接続が切断されました");
+      }
+    }
+
+    async function connectRoom() {
+      const status = await fetchRoomStatus(currentRoomId);
+      viewerCountEl.textContent = status.viewerCount ?? "-";
+      viewerLimitEl.textContent = status.limits?.viewerLimit ?? "-";
+      roomStateEl.textContent = status.state || "-";
+      if (status.state !== "live") {
+        throw new Error("ライブが開始されていません");
+      }
+      if (status.limits?.full) {
+        throw new Error("満員です");
+      }
+      if (status.watchCodeRequired && !currentWatchCode) {
+        throw new Error("視聴コードを入力してください");
+      }
+      cleanupPeer();
+      pc = new RTCPeerConnection();
+      pc.addEventListener("connectionstatechange", handlePCState);
+      pc.addEventListener("track", (event) => {
+        const [stream] = event.streams;
+        if (stream) {
+          videoFrame.srcObject = stream;
         }
-        decodeFailures += 1;
-        if (decodeFailures < 3) {
-          setBanner('Audio decode retrying...');
-          return;
-        }
-        audioFallbackMode = true;
-        audioStartAt = null;
-        firstAudioTs = null;
-        setBanner('Audio fallback mode');
+      });
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitIce();
+      const response = await fetch(`/api/room/${currentRoomId}/subscribe/offer`, {
+        method: "POST",
+        headers: JSON_HEADER,
+        body: JSON.stringify({
+          offer: pc.localDescription?.sdp,
+          watchCode: currentWatchCode,
+          viewerId,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || "subscribe_failed");
       }
-
-      // Fallback: play via <audio> element (no A/V sync but audible)
-      const blob = new Blob([data], { type: mime });
-      const url = URL.createObjectURL(blob);
-      audioEl.src = url;
-      audioEl.play().catch(() => {});
+      if (!payload.viewerAnswer?.sdp) {
+        throw new Error("無効な回答");
+      }
+      await pc.setRemoteDescription({
+        type: payload.viewerAnswer.type || "answer",
+        sdp: payload.viewerAnswer.sdp,
+      });
+      viewerId = payload.viewerId || viewerId;
+      updateConnectionState("connected");
+      startStatsTimer();
+      startStatusTimer();
+      setBanner("");
     }
 
-    function currentAudioTime() {
-      if (!audioCtx || audioStartAt === null || firstAudioTs === null) return null;
-      const drift = (audioCtx.currentTime - audioStartAt) * 1000;
-      return firstAudioTs + drift;
-    }
-
-    function scheduleVideo() {
-      if (videoQueue.length === 0) {
-        requestAnimationFrame(scheduleVideo);
-        return;
-      }
-      const audioTime = currentAudioTime();
-      const ctx = canvas.getContext('2d');
-      if (audioTime === null) {
-        const frame = videoQueue.shift();
-        drawFrame(frame, ctx);
-        requestAnimationFrame(scheduleVideo);
-        return;
-      }
-      const target = videoQueue.filter((f) => f.ts <= audioTime);
-      const frame = target[target.length - 1];
-      if (frame) {
-        videoQueue = videoQueue.filter((f) => f.ts > frame.ts).slice(-50);
-        drawFrame(frame, ctx);
-      } else if (videoQueue.length > 20) {
-        // too late
-        videoQueue.shift();
-      }
-      const delta = frame ? frame.ts - audioTime : 0;
-      if (Math.abs(delta) > 400 && frame) {
-        setBanner('A/V reset');
-        videoQueue = [];
-        if (audioCtx && firstAudioTs !== null) {
-          audioStartAt = audioCtx.currentTime + playbackOffsetMs / 1000;
-          firstAudioTs = frame.ts;
-        }
-      } else if (Math.abs(delta) > 150 && frame) {
-        setBanner('Minor sync adjust');
-        audioStartAt -= delta / 1000 * 0.2;
-      }
-      audioLagMs = frame ? -delta : audioLagMs;
-      fpsTimes.push(performance.now());
-      fpsTimes = fpsTimes.filter((t) => t > performance.now() - 3000);
-      updateStatus({ delay: Math.round(audioLagMs), fps: fpsTimes.length / 3, buffer: Math.round(videoQueue.length * 50) });
-      requestAnimationFrame(scheduleVideo);
-    }
-
-    function drawFrame(frame, ctx) {
-      const img = new Image();
-      img.onload = () => {
-        ctx.canvas.width = img.naturalWidth;
-        ctx.canvas.height = img.naturalHeight;
-        ctx.drawImage(img, 0, 0);
-        videoFrame.src = ctx.canvas.toDataURL('image/jpeg', 0.8);
-      };
-      img.src = frame.data;
-    }
-
-    function handleMessage(event) {
-      let msg;
-      try { msg = JSON.parse(event.data); } catch (e) { return; }
-      if (!msg || typeof msg.type !== 'string') return;
-      if (msg.type === 'video') {
-        videoQueue.push({ ts: msg.ts, data: msg.data });
-        if (videoQueue.length > 80) videoQueue.shift();
-      } else if (msg.type === 'audio') {
-        playAudioChunk(msg);
-      } else if (msg.type === 'eos') {
-        setBanner('Broadcast ended');
-        ws?.close(4001, 'eos');
-        scheduleReconnect();
-      } else if (msg.type === 'ping' && typeof msg.ts === 'number') {
-        ws?.send(JSON.stringify({ type: 'pong', ts: msg.ts }));
-      } else if (msg.type === 'pong' && typeof msg.ts === 'number') {
-        lastPongTs = Date.now();
-      }
-    }
-
-    function setupPing() {
-      clearInterval(pingTimer);
-      pingTimer = setInterval(() => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        const now = Date.now();
-        if (lastPingTs && lastPongTs < lastPingTs && now - lastPingTs > 15000) {
-          ws.close(4000, 'pong timeout');
-          return;
-        }
-        lastPingTs = now;
-        ws.send(JSON.stringify({ type: 'ping', ts: now }));
-      }, 5000);
-    }
-
-    function connect() {
-      lastPingTs = 0;
-      lastPongTs = 0;
-      ws = new WebSocket(wsUrl());
-      connectionEl.textContent = 'connecting';
-      ws.addEventListener('open', () => {
-        connectionEl.textContent = 'connected';
-        setBanner('connected');
+    async function attemptConnect() {
+      try {
+        await leaveRoom();
+        await connectRoom();
+        retries = 0;
+        reconnectEl.textContent = retries;
         backoff = 1000;
-        reconnectAttempts = 0;
-        setupPing();
-      });
-      ws.addEventListener('message', handleMessage);
-      ws.addEventListener('close', () => {
-        connectionEl.textContent = 'closed';
-        setBanner('disconnected, retrying...');
-        scheduleReconnect();
-        clearInterval(pingTimer);
-      });
-      ws.addEventListener('error', () => {
-        connectionEl.textContent = 'error';
-        scheduleReconnect();
-        clearInterval(pingTimer);
-      });
+      } catch (error) {
+        console.warn("connect failed", error);
+        scheduleReconnect(error.message || "接続に失敗しました");
+      }
     }
 
-    function scheduleReconnect() {
-      if (!isStarted) return;
-      reconnectAttempts += 1;
-      reconnectEl.textContent = reconnectAttempts;
+    function scheduleReconnect(message) {
+      if (!isPlaying) return;
+      setBanner(message);
+      updateConnectionState("retrying");
+      retries += 1;
+      reconnectEl.textContent = retries;
+      if (retries > MAX_RECONNECTS) {
+        setBanner("再接続上限に達しました");
+        stopViewing();
+        return;
+      }
+      cleanupPeer();
+      stopStatsTimer();
+      stopStatusTimer();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        attemptConnect();
+      }, Math.min(backoff, 30000));
       backoff = Math.min(backoff * 2, 30000);
-      clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(() => connect(), backoff);
     }
 
-    playBtn.addEventListener('click', async () => {
-      isStarted = true;
+    function stopViewing() {
+      isPlaying = false;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      cleanupPeer();
+      stopStatsTimer();
+      stopStatusTimer();
+      leaveRoom();
+      updateConnectionState("disconnected");
+      resetIndicators();
+      setBanner("視聴を停止しました");
+      playBtn.disabled = false;
+    }
+
+    function startViewing() {
+      if (isPlaying) return;
+      currentRoomId = roomInput.value.trim();
+      currentWatchCode = codeInput.value.trim();
+      if (!currentRoomId) {
+        setBanner("Room IDを入力してください");
+        return;
+      }
+      isPlaying = true;
+      retries = 0;
+      reconnectEl.textContent = retries;
       playBtn.disabled = true;
-      await ensureAudioContext();
-      connect();
-      scheduleVideo();
-    });
+      updateConnectionState("connecting");
+      attemptConnect();
+    }
+
+    playBtn.addEventListener("click", startViewing);
+    window.addEventListener("beforeunload", stopViewing);
   </script>
 </body>
 </html>

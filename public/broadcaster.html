@@ -15,6 +15,9 @@
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     .status { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin-top: 12px; }
     .status div { background: #111827; padding: 8px; border-radius: 8px; font-size: 14px; }
+    .room-info { margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
+    .room-info div { background: #111827; padding: 8px; border-radius: 8px; font-size: 14px; }
+    .room-info a { color: #60a5fa; word-break: break-all; }
     #preview { width: 100%; max-width: 480px; background: #1f2937; border-radius: 8px; }
     .badge { display: inline-block; padding: 2px 6px; border-radius: 6px; font-size: 12px; background: #111827; }
   </style>
@@ -49,19 +52,24 @@
     </label>
   </div>
   <video id="preview" autoplay playsinline muted></video>
-  <canvas id="canvas" width="640" height="480" hidden></canvas>
   <div class="status">
     <div>RTT: <span id="rtt">-</span> ms</div>
     <div>FPS: <span id="fps">0</span></div>
     <div>Quality: <span id="quality" class="badge">-</span></div>
-    <div>Buffered: <span id="buffered">0</span> KB</div>
+    <div>Buffered: <span id="buffered">0</span> ms</div>
     <div>State: <span id="state">idle</span></div>
     <div>Connection: <span id="connection" class="badge">-</span></div>
+    <div>Viewers: <span id="viewerCount">0</span>/<span id="viewerLimit">0</span></div>
   </div>
+  <div class="room-info">
+    <div>Room ID: <span id="roomIdDisplay">-</span></div>
+    <div>Watch Code: <span id="watchCodeDisplay">-</span></div>
+    <div>Watch URL: <a id="watchUrlDisplay" href="#" target="_blank" rel="noreferrer">-</a></div>
+  </div>
+  <div class="banner" id="statusBanner"></div>
 
   <script>
     const preview = document.getElementById('preview');
-    const canvas = document.getElementById('canvas');
     const startBtn = document.getElementById('start');
     const stopBtn = document.getElementById('stop');
     const micToggleBtn = document.getElementById('micToggle');
@@ -74,344 +82,332 @@
     const bufferedEl = document.getElementById('buffered');
     const stateEl = document.getElementById('state');
     const connectionEl = document.getElementById('connection');
+    const viewerCountEl = document.getElementById('viewerCount');
+    const viewerLimitEl = document.getElementById('viewerLimit');
+    const roomIdEl = document.getElementById('roomIdDisplay');
+    const watchCodeEl = document.getElementById('watchCodeDisplay');
+    const watchUrlEl = document.getElementById('watchUrlDisplay');
+    const statusBanner = document.getElementById('statusBanner');
 
-    const MAX_IMAGE_BASE64 = 750000; // must match server limit
-    const AUDIO_MIME_CANDIDATES = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/ogg;codecs=opus',
-      'audio/mp4',
-    ];
-
-    const resolutions = {
-      low: { width: 320, height: 240 },
-      medium: { width: 640, height: 480 },
+    const JSON_HEADER = { "Content-Type": "application/json" };
+    const QUALITY_PROFILES = {
+      low: { label: "Low", videoBitrate: 500, audioBitrate: 48, fps: 10 },
+      medium: { label: "Medium", videoBitrate: 900, audioBitrate: 64, fps: 15 },
+      high: { label: "High", videoBitrate: 1600, audioBitrate: 96, fps: 24 },
+    };
+    const RESOLUTIONS = {
+      low: { width: 640, height: 360 },
+      medium: { width: 960, height: 540 },
       high: { width: 1280, height: 720 },
     };
 
-    const qualitySteps = [
-      { label: 'High', jpegQuality: 0.8, fps: 10, resolution: 'high' },
-      { label: 'Medium', jpegQuality: 0.6, fps: 7, resolution: 'medium' },
-      { label: 'Low', jpegQuality: 0.4, fps: 5, resolution: 'low' },
-    ];
+    let pc = null;
+    let localStream = null;
+    let roomDetails = null;
+    let statsInterval = null;
+    let statusInterval = null;
+    let isStreaming = false;
+    let lastVideoStats = null;
 
-    let ws = null;
-    let mediaStream = null;
-    let mediaRecorder = null;
-    let chosenAudioMime = null;
-    let sending = false;
-    let frameTimes = [];
-    let qualityIndex = 0;
-    let downgradeAt = 0;
-    let stableSince = 0;
-    let warnCount = 0;
-    let rafId = null;
-    let lastPingTs = 0;
-    let lastPongTs = 0;
-    let pingTimer = null;
-
-    function logStatus(message) {
-      console.log('[broadcaster]', message);
+    function setBanner(message) {
+      statusBanner.textContent = message || "";
     }
 
     function updateStatus(partial) {
       if (partial.rtt !== undefined) rttEl.textContent = partial.rtt;
-      if (partial.fps !== undefined) fpsEl.textContent = partial.fps.toFixed(1);
+      if (partial.fps !== undefined) fpsEl.textContent = partial.fps;
       if (partial.quality !== undefined) qualityEl.textContent = partial.quality;
       if (partial.buffered !== undefined) bufferedEl.textContent = partial.buffered;
       if (partial.state !== undefined) stateEl.textContent = partial.state;
       if (partial.connection !== undefined) connectionEl.textContent = partial.connection;
+      if (partial.viewerCount !== undefined) viewerCountEl.textContent = partial.viewerCount;
+      if (partial.viewerLimit !== undefined) viewerLimitEl.textContent = partial.viewerLimit;
     }
 
-    function currentQuality() {
-      return qualitySteps[qualityIndex];
+    function qualityProfile() {
+      return QUALITY_PROFILES[resolutionSelect.value] || QUALITY_PROFILES.medium;
     }
 
-    function computeWsUrl() {
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      return `${proto}://${location.host}/ws?role=broadcaster&key=${encodeURIComponent(keyInput.value.trim())}`;
-    }
-
-    function applyCanvasResolution() {
-      const res = resolutions[resolutionSelect.value];
-      if (res) {
-        canvas.width = res.width;
-        canvas.height = res.height;
-      }
-    }
+    resolutionSelect.addEventListener("change", () => {
+      qualityEl.textContent = `${qualityProfile().label} (${resolutionSelect.value})`;
+    });
 
     async function setupMedia() {
-      const res = resolutions[resolutionSelect.value];
-      const facingMode = cameraSelect.value === 'environment' ? { exact: 'environment' } : 'user';
-      const constraints = {
-        video: { width: res.width, height: res.height, facingMode },
+      const resolution = RESOLUTIONS[resolutionSelect.value] || RESOLUTIONS.medium;
+      const facingMode = cameraSelect.value === "environment" ? "environment" : "user";
+      localStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: resolution.width, height: resolution.height, facingMode },
         audio: true,
-      };
-      mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-      preview.srcObject = mediaStream;
-      await preview.play();
-      applyCanvasResolution();
+      });
+      preview.srcObject = localStream;
+      await preview.play().catch(() => {});
     }
 
-    function stopTracks() {
-      if (mediaStream) {
-        mediaStream.getTracks().forEach((t) => t.stop());
-        mediaStream = null;
-      }
+    function stopLocalStream() {
+      if (!localStream) return;
+      localStream.getTracks().forEach((track) => track.stop());
+      preview.srcObject = null;
+      localStream = null;
     }
 
-    function detachMediaRecorder() {
-      if (mediaRecorder) {
-        try { mediaRecorder.stop(); } catch (e) {}
-        mediaRecorder = null;
-      }
+    function createPeerConnection() {
+      const connection = new RTCPeerConnection();
+      connection.addEventListener("iceconnectionstatechange", () => {
+        const state = connection.iceConnectionState;
+        if (state === "failed" || state === "disconnected") {
+          setBanner("ICE connection lost");
+        }
+      });
+      return connection;
     }
 
-    function base64FromBlob(blob) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const dataUrl = reader.result;
-          const base64 = dataUrl.split(',')[1];
-          resolve(base64);
+    function stopPeerConnection() {
+      if (!pc) return;
+      pc.getSenders().forEach((sender) => {
+        sender.track?.stop();
+      });
+      pc.close();
+      pc = null;
+      lastVideoStats = null;
+    }
+
+    async function waitForIceGathering() {
+      if (!pc) return;
+      if (pc.iceGatheringState === "complete") return;
+      await new Promise((resolve) => {
+        const handler = () => {
+          if (pc.iceGatheringState === "complete") {
+            pc.removeEventListener("icegatheringstatechange", handler);
+            resolve();
+          }
         };
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
+        pc.addEventListener("icegatheringstatechange", handler);
       });
     }
 
-    function pickAudioMime() {
-      for (const cand of AUDIO_MIME_CANDIDATES) {
-        if (window.MediaRecorder && MediaRecorder.isTypeSupported(cand)) {
-          return cand;
-        }
-      }
-      return null;
-    }
-
-    function sendAudio() {
-      if (!mediaStream) return;
-      const audioTrack = mediaStream.getAudioTracks()[0];
-      if (!audioTrack) return;
-      const audioStream = new MediaStream([audioTrack]);
-      chosenAudioMime = pickAudioMime();
-      const options = chosenAudioMime ? { mimeType: chosenAudioMime } : {};
-      try {
-        mediaRecorder = new MediaRecorder(audioStream, options);
-      } catch (e) {
-        console.error('MediaRecorder failed', e);
-        throw e;
-      }
-      mediaRecorder.ondataavailable = async (event) => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        const base64 = await base64FromBlob(event.data);
-        if (base64.length > 300000) return;
-        const payload = { type: 'audio', ts: Date.now(), data: base64, mime: chosenAudioMime || undefined };
-        ws.send(JSON.stringify(payload));
+    async function createRoom() {
+      const payload = {
+        viewerLimit: 10,
+        key: keyInput.value.trim(),
       };
-      mediaRecorder.start(500);
-    }
-
-    function effectiveFps(now) {
-      frameTimes.push(now);
-      const cutoff = now - 3000;
-      frameTimes = frameTimes.filter((t) => t >= cutoff);
-      return frameTimes.length / 3;
-    }
-
-    function attemptDowngrade(reason) {
-      if (Date.now() - downgradeAt < 5000) return;
-      const q = qualityIndex;
-      const resOrder = ['high', 'medium', 'low'];
-      if (qualityIndex < qualitySteps.length - 1) {
-        qualityIndex += 1;
-        logStatus(`Quality down: ${reason}`);
-      } else {
-        const currentResIndex = resOrder.indexOf(resolutionSelect.value);
-        if (currentResIndex < resOrder.length - 1) {
-          resolutionSelect.value = resOrder[currentResIndex + 1];
-          logStatus(`Resolution down: ${reason}`);
-          applyCanvasResolution();
-        }
+      const response = await fetch("/api/room/create", {
+        method: "POST",
+        headers: JSON_HEADER,
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || "room_creation_failed");
       }
-      downgradeAt = Date.now();
-      stableSince = 0;
-    }
-
-    function attemptUpgrade() {
-      if (!stableSince || Date.now() - stableSince < 30000) return;
-      const resOrder = ['low', 'medium', 'high'];
-      const currentResIndex = resOrder.indexOf(resolutionSelect.value);
-      if (qualityIndex > 0) {
-        qualityIndex -= 1;
-        logStatus('Quality up');
-      } else if (currentResIndex < resOrder.length - 1) {
-        resolutionSelect.value = resOrder[currentResIndex + 1];
-        logStatus('Resolution up');
-        applyCanvasResolution();
-      }
-      stableSince = Date.now();
-    }
-
-    function drawLoop() {
-      if (!sending || !ws || ws.readyState !== WebSocket.OPEN || !mediaStream) return;
-      const quality = currentQuality();
-      const now = performance.now();
-      const fpsNow = effectiveFps(now);
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
-      const dataUrl = canvas.toDataURL('image/jpeg', quality.jpegQuality);
-      const base64Len = dataUrl.length - 'data:image/jpeg;base64,'.length;
-      if (base64Len > MAX_IMAGE_BASE64) {
-        attemptDowngrade('too_large');
+      roomDetails = data;
+      roomIdEl.textContent = data.roomId || "-";
+      watchCodeEl.textContent = data.watchCode || "-";
+      if (data.watchUrl) {
+        watchUrlEl.textContent = data.watchUrl;
+        watchUrlEl.href = data.watchUrl;
       } else {
-        const payload = { type: 'video', ts: Date.now(), data: dataUrl };
-        ws.send(JSON.stringify(payload));
+        watchUrlEl.textContent = "-";
+        watchUrlEl.removeAttribute("href");
       }
       updateStatus({
-        fps: fpsNow,
-        quality: `${quality.label} (${resolutionSelect.value})`,
-        buffered: Math.round(ws.bufferedAmount / 1024),
+        viewerCount: data.viewerCount ?? 0,
+        viewerLimit: data.limits?.viewerLimit ?? "-",
+        state: data.state || "idle",
       });
+    }
 
-      const buf = ws.bufferedAmount;
-      const nowTs = Date.now();
-      if (buf > 500000 || fpsNow < quality.fps - 2 || (lastPongTs && nowTs - lastPongTs > 15000)) {
-        warnCount = 0;
-        attemptDowngrade('drop');
-      } else if (buf > 200000) {
-        warnCount += 1;
-        if (warnCount >= 3) {
-          attemptDowngrade('warn');
-          warnCount = 0;
-        }
-      } else if (buf < 200000 && fpsNow >= quality.fps - 1) {
-        warnCount = 0;
-        if (!stableSince) stableSince = Date.now();
-        attemptUpgrade();
+    async function postPublish(offer) {
+      const profile = qualityProfile();
+      const response = await fetch(`/api/room/${roomDetails.roomId}/publish/offer`, {
+        method: "POST",
+        headers: JSON_HEADER,
+        body: JSON.stringify({
+          offer,
+          tracks: [
+            { trackName: "video", kind: "video", bitrate: profile.videoBitrate },
+            { trackName: "audio", kind: "audio", bitrate: profile.audioBitrate },
+          ],
+          key: keyInput.value.trim(),
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.error || "publish_failed");
       }
-
-      updateConnectionStrength({ rtt: rttEl.textContent, fpsNow, buf });
-
-      const frameInterval = 1000 / quality.fps;
-      rafId = setTimeout(() => requestAnimationFrame(drawLoop), frameInterval);
+      return payload;
     }
 
-    function updateConnectionStrength({ rtt, fpsNow, buf }) {
-      const targetFps = currentQuality().fps;
-      const fpsRatio = fpsNow / targetFps;
-      const rttNum = Number(rtt);
-      let label = 'Normal';
-      if ((buf > 500000) || fpsRatio < 0.4 || rttNum > 400) {
-        label = 'Bad';
-      } else if (buf > 200000 || fpsRatio < 0.7 || rttNum > 250) {
-        label = 'Weak';
-      } else if (buf < 80000 && fpsRatio > 0.9 && rttNum > 0 && rttNum < 120) {
-        label = 'Strong';
+    async function startPublishing() {
+      pc = createPeerConnection();
+      localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+      updateStatus({ state: "connecting" });
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering();
+      const payload = await postPublish(pc.localDescription.sdp);
+      if (!payload?.publisherAnswer?.sdp) {
+        throw new Error("invalid_answer");
       }
-      updateStatus({ connection: label });
+      await pc.setRemoteDescription({
+        type: payload.publisherAnswer.type || "answer",
+        sdp: payload.publisherAnswer.sdp,
+      });
+      updateStatus({ state: "streaming" });
     }
 
-    function setupPing() {
-      pingTimer = setInterval(() => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        const now = Date.now();
-        if (lastPingTs && lastPongTs < lastPingTs && now - lastPingTs > 30000) {
-          logStatus('pong timeout, closing connection');
-          ws.close(4000, 'pong timeout');
-          return;
-        }
-        lastPingTs = now;
-        ws.send(JSON.stringify({ type: 'ping', ts: now }));
-      }, 5000);
-      return pingTimer;
+    function startStatsPolling() {
+      stopStatsPolling();
+      statsInterval = setInterval(() => {
+        if (!pc) return;
+        pc.getStats().then((stats) => {
+          stats.forEach((report) => {
+            if (report.type === "outbound-rtp" && report.kind === "video") {
+              const rttMs = report.roundTripTime ? Math.round(report.roundTripTime * 1000) : "-";
+              const jitterMs = report.jitter ? Math.round(report.jitter * 1000) : "-";
+              let fpsValue = "-";
+              if (lastVideoStats) {
+                const deltaFrames = (report.framesEncoded || 0) - (lastVideoStats.framesEncoded || 0);
+                const deltaTime = report.timestamp - lastVideoStats.timestamp || 1;
+                fpsValue =
+                  deltaFrames && deltaTime ? ((deltaFrames / deltaTime) * 1000).toFixed(1) : "-";
+              }
+              lastVideoStats = report;
+              const loss = report.packetsLost || 0;
+              const sent = report.packetsSent || 0;
+              const lossRatio = sent ? loss / sent : 0;
+              const connectionLabel =
+                lossRatio > 0.05 || (typeof rttMs === "number" && rttMs > 400)
+                  ? "Bad"
+                  : lossRatio > 0.02 || (typeof rttMs === "number" && rttMs > 250)
+                    ? "Weak"
+                    : lossRatio < 0.005 && typeof rttMs === "number" && rttMs < 120
+                      ? "Strong"
+                      : "Normal";
+              updateStatus({
+                rtt: typeof rttMs === "number" ? rttMs : "-",
+                fps: fpsValue,
+                buffered: jitterMs,
+                connection: connectionLabel,
+                quality: `${qualityProfile().label} (${resolutionSelect.value})`,
+              });
+            }
+          });
+        });
+      }, 2000);
     }
 
-    function handleWs() {
-      const url = computeWsUrl();
-      ws = new WebSocket(url);
-      ws.addEventListener('open', () => {
-        sending = true;
-        stateEl.textContent = 'streaming';
-        drawLoop();
+    function stopStatsPolling() {
+      if (statsInterval) {
+        clearInterval(statsInterval);
+        statsInterval = null;
+      }
+    }
+
+    function startStatusPolling() {
+      stopStatusPolling();
+      statusInterval = setInterval(refreshRoomStatus, 5000);
+    }
+
+    function stopStatusPolling() {
+      if (statusInterval) {
+        clearInterval(statusInterval);
+        statusInterval = null;
+      }
+    }
+
+    async function refreshRoomStatus() {
+      if (!roomDetails?.roomId) return;
+      const response = await fetch(`/api/room/${roomDetails.roomId}/status`);
+      if (!response.ok) return;
+      const data = await response.json().catch(() => ({}));
+      updateStatus({
+        viewerCount: data.viewerCount ?? 0,
+        viewerLimit: data.limits?.viewerLimit ?? "-",
       });
-      ws.addEventListener('message', (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'pong' && typeof msg.ts === 'number') {
-            lastPongTs = Date.now();
-            const rtt = lastPongTs - msg.ts;
-            updateStatus({ rtt });
-          }
-        } catch (e) {}
-      });
-      ws.addEventListener('close', () => {
-        sending = false;
-        stateEl.textContent = 'closed';
-        if (pingTimer) clearInterval(pingTimer);
-      });
-      ws.addEventListener('error', () => {
-        sending = false;
-        stateEl.textContent = 'error';
-        if (pingTimer) clearInterval(pingTimer);
-      });
-      return ws;
+      if (data.limits?.full) {
+        setBanner("Viewer limit reached");
+      } else {
+        setBanner("");
+      }
+    }
+
+    async function endRoom() {
+      if (!roomDetails?.roomId) return;
+      await fetch(`/api/room/${roomDetails.roomId}/end`, {
+        method: "POST",
+        headers: JSON_HEADER,
+      }).catch(() => {});
     }
 
     async function startStreaming() {
-      if (sending) return;
+      if (isStreaming) return;
+      setBanner("");
       startBtn.disabled = true;
+      stopBtn.disabled = true;
+      micToggleBtn.disabled = true;
       resolutionSelect.disabled = true;
       cameraSelect.disabled = true;
       keyInput.disabled = true;
       try {
         await setupMedia();
-        const socket = handleWs();
-        sendAudio();
-        setupPing();
-        micToggleBtn.disabled = false;
+        await createRoom();
+        await startPublishing();
+        isStreaming = true;
         stopBtn.disabled = false;
-      } catch (e) {
-        console.error(e);
+        micToggleBtn.disabled = false;
+        startStatsPolling();
+        startStatusPolling();
+        qualityEl.textContent = `${qualityProfile().label} (${resolutionSelect.value})`;
+      } catch (error) {
+        console.error(error);
+        setBanner(error.message || "Failed to start broadcast");
         stopStreaming();
       }
     }
 
-    function stopStreaming() {
-      sending = false;
-      if (rafId) cancelAnimationFrame(rafId);
-      detachMediaRecorder();
-      stopTracks();
-      if (ws) {
-        ws.close();
-        ws = null;
-      }
-      if (pingTimer) {
-        clearInterval(pingTimer);
-        pingTimer = null;
-      }
+    async function stopStreaming() {
+      stopStatsPolling();
+      stopStatusPolling();
+      stopPeerConnection();
+      stopLocalStream();
+      await endRoom();
+      isStreaming = false;
       startBtn.disabled = false;
+      stopBtn.disabled = true;
+      micToggleBtn.disabled = true;
       resolutionSelect.disabled = false;
       cameraSelect.disabled = false;
       keyInput.disabled = false;
-      micToggleBtn.disabled = true;
-      stopBtn.disabled = true;
-      frameTimes = [];
-      updateStatus({ state: 'idle', fps: 0, buffered: 0, rtt: '-', quality: '-' });
+      micToggleBtn.textContent = 'Mic: ON';
+      updateStatus({
+        state: "idle",
+        rtt: "-",
+        fps: "-",
+        buffered: "0",
+        connection: "-",
+        viewerCount: 0,
+        viewerLimit: "-",
+        quality: "-",
+      });
+      roomDetails = null;
+      roomIdEl.textContent = "-";
+      watchCodeEl.textContent = "-";
+      watchUrlEl.textContent = "-";
+      watchUrlEl.removeAttribute("href");
+      setBanner("");
     }
 
-    startBtn.addEventListener('click', startStreaming);
-    stopBtn.addEventListener('click', stopStreaming);
-
-    micToggleBtn.addEventListener('click', () => {
-      if (!mediaStream) return;
-      const audioTrack = mediaStream.getAudioTracks()[0];
+    micToggleBtn.addEventListener("click", () => {
+      if (!localStream) return;
+      const audioTrack = localStream.getAudioTracks()[0];
       if (!audioTrack) return;
       audioTrack.enabled = !audioTrack.enabled;
-      micToggleBtn.textContent = `Mic: ${audioTrack.enabled ? 'ON' : 'OFF'}`;
+      micToggleBtn.textContent = `Mic: ${audioTrack.enabled ? "ON" : "OFF"}`;
     });
 
-    window.addEventListener('beforeunload', stopStreaming);
+    startBtn.addEventListener("click", startStreaming);
+    stopBtn.addEventListener("click", stopStreaming);
+    window.addEventListener("beforeunload", stopStreaming);
   </script>
 </body>
 </html>
