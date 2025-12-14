@@ -52,7 +52,3 @@ Cloudflare Pages の静的 UI と Workers + Durable Object を組み合わせ、
 - 視聴者 UI の再接続は指数バックオフ（1→2→4→8→16秒、最大 5 回）で止め、`state=ended` または `limits.full` 時に手動再接続へ誘導。
 - 失敗やエラーは `banner` でユーザーに「回線不安定」や「再試行」状態を告知。
 
-## テスト
-
-- `npm test` は `package.json` がないため `ENOENT` エラーが発生します。JavaScript/HTML を変更したらブラウザでのシナリオ確認（room create/publish, viewer subscribe/offers）を手動で行ってください。
-
